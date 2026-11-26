@@ -170,15 +170,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Tap, style-check, install, and test formula on Linuxbrew
+      - name: Tap, load, install, and test formula on Linuxbrew
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           TAP_DIR="$(brew --repository)/Library/Taps/local/homebrew-ci"
           mkdir -p "$(dirname "$TAP_DIR")"
           ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
+          brew readall "local/ci"
           for f in Formula/*.rb; do
             pkg=$(basename "$f" .rb)
-            brew style "local/ci/$pkg"
             brew install --verbose --formula "local/ci/$pkg"
             brew test --verbose "local/ci/$pkg"
             brew uninstall "local/ci/$pkg"
@@ -192,14 +192,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Tap, style-check, source-build, and test formula on macOS
+      - name: Tap, load, source-build, and test formula on macOS
         run: |
           TAP_DIR="$(brew --repository)/Library/Taps/local/homebrew-ci"
           mkdir -p "$(dirname "$TAP_DIR")"
           ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
+          brew readall "local/ci"
           for f in Formula/*.rb; do
             pkg=$(basename "$f" .rb)
-            brew style "local/ci/$pkg"
             brew install --verbose --formula "local/ci/$pkg"
             brew test --verbose "local/ci/$pkg"
             brew uninstall "local/ci/$pkg"
