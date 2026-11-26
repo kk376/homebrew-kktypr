@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  verify-formula:
+    name: Verify Formula Syntax, Hashes & Tarballs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ruby syntax check
+        run: |
+          for f in Formula/*.rb; do
+            ruby -c "$f"
+          done
+
+      - name: Verify live URLs, SHA-256 digests, and archive payloads
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tarfile
+          import tempfile
+
+          HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+          STR_FIELD_RE = re.compile(r'^\s*(desc|homepage|version|url|sha256)\s+"([^"]+)"')
+          BLOCK_RE = re.compile(r"^\s*(on_macos|on_linux|on_arm|on_intel|test)\s+do\b")
+
+          def download(url, dest):
+              if not url.startswith("https://"):
+                  raise SystemExit(f"Non-HTTPS URL rejected: {url}")
+              subprocess.run(
+                  ["curl", "--proto", "=https", "--tlsv1.2", "-fsSL", "-o", str(dest), url],
+                  check=True,
+              )
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(65536), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def verify_checksums_txt(asset_url, expected_sha, tmpdir, cache):
+              if "/releases/download/" not in asset_url:
+                  return
+              baseurl, filename = asset_url.rsplit("/", 1)
+              sums_url = f"{baseurl}/SHA256SUMS.txt"
+              if sums_url not in cache:
+                  hp = tmpdir / f"SHA256SUMS_{len(cache)}.txt"
+                  download(sums_url, hp)
+                  cache[sums_url] = hp.read_text(encoding="utf-8", errors="replace")
+              for raw_line in cache[sums_url].splitlines():
+                  parts = raw_line.strip().split()
+                  if len(parts) >= 2 and parts[1].lstrip("*./") == filename:
+                      if parts[0].lower() != expected_sha:
+                          raise SystemExit(
+                              f"{sums_url} hash mismatch for {filename}: formula={expected_sha}, sums={parts[0]}"
+                          )
+                      print(f"OK SHA256SUMS.txt cross-check: {filename}")
+                      return
+              raise SystemExit(f"Asset '{filename}' not listed in {sums_url}")
+
+          formulas = sorted(pathlib.Path("Formula").glob("*.rb"))
+          if not formulas:
+              raise SystemExit("No Formula/*.rb files found")
+
+          checksum_cache = {}
+          with tempfile.TemporaryDirectory() as tmp:
+              tmpdir = pathlib.Path(tmp)
+              for formula_path in formulas:
+                  pkg = formula_path.stem
+                  content = formula_path.read_text(encoding="utf-8")
+                  if not re.search(r"^\s*license\b", content, re.MULTILINE):
+                      raise SystemExit(f"{formula_path}: missing license declaration")
+
+                  context = "top"
+                  fields = {}
+                  pending = {}
+                  targets = []
+                  for line in content.splitlines():
+                      m_blk = BLOCK_RE.match(line)
+                      if m_blk:
+                          context = m_blk.group(1)
+                          continue
+                      m_fld = STR_FIELD_RE.match(line)
+                      if not m_fld:
+                          continue
+                      key, val = m_fld.group(1), m_fld.group(2)
+                      if key in ("desc", "homepage", "version"):
+                          fields[key] = val
+                      else:
+                          pending.setdefault(context, {})[key] = val
+                          ctx_map = pending[context]
+                          if "url" in ctx_map and "sha256" in ctx_map:
+                              targets.append((context, ctx_map["url"], ctx_map["sha256"]))
+                              pending[context] = {}
+
+                  for req in ("desc", "homepage", "version"):
+                      if req not in fields:
+                          raise SystemExit(f"{formula_path}: missing required field '{req}'")
+                  if any(pending.values()):
+                      raise SystemExit(f"{formula_path}: unpaired url/sha256 in {pending}")
+                  if not targets:
+                      raise SystemExit(f"{formula_path}: no url/sha256 targets found")
+
+                  version = fields["version"]
+                  if f"{pkg} {version}" not in content:
+                      raise SystemExit(f"{formula_path}: test block should assert '{pkg} {version}'")
+
+                  for idx, (ctx, url, digest) in enumerate(targets):
+                      if version not in url:
+                          raise SystemExit(f"{formula_path} [{ctx}]: version '{version}' missing from URL {url}")
+                      clean_sha = digest.lower()
+                      if not HEX64_RE.fullmatch(clean_sha):
+                          raise SystemExit(f"{formula_path} [{ctx}]: expected 64-hex sha256, got '{digest}'")
+                      tar_path = tmpdir / f"{pkg}_{ctx}_{idx}.tar.gz"
+                      print(f"Downloading {url} ...")
+                      download(url, tar_path)
+                      actual = sha256_file(tar_path)
+                      if actual != clean_sha:
+                          raise SystemExit(
+                              f"{formula_path} [{ctx}]: SHA-256 mismatch for {url}! formula={clean_sha} actual={actual}"
+                          )
+                      print(f"OK SHA-256 [{ctx}]: {actual}")
+                      verify_checksums_txt(url, clean_sha, tmpdir, checksum_cache)
+
+                      with tarfile.open(tar_path) as tf:
+                          members = [m.name.lstrip("./") for m in tf.getmembers()]
+                      if "/archive/" in url:
+                          if not any(m == "Cargo.toml" or m.endswith("/Cargo.toml") for m in members):
+                              raise SystemExit(f"{formula_path} [{ctx}]: Cargo.toml not found in source tarball")
+                          print(f"OK source tarball [{ctx}]: Cargo.toml present")
+                      elif "/releases/download/" in url:
+                          if not any(os.path.basename(m) == pkg for m in members):
+                              raise SystemExit(f"{formula_path} [{ctx}]: binary '{pkg}' not found in release tarball")
+                          print(f"OK release tarball [{ctx}]: binary '{pkg}' present")
+          PY
+
+  brew-test-linux:
+    name: Homebrew Install & Test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Tap, load, install, and test formula on Linuxbrew
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          TAP_DIR="$(brew --repository)/Library/Taps/local/homebrew-ci"
+          mkdir -p "$(dirname "$TAP_DIR")"
+          ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
+          brew readall "local/ci"
+          for f in Formula/*.rb; do
+            pkg=$(basename "$f" .rb)
+            brew install --verbose --formula "local/ci/$pkg"
+            brew test --verbose "local/ci/$pkg"
+            brew uninstall "local/ci/$pkg"
+          done
+
+  brew-test-macos:
+    name: Homebrew Source Build & Test (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Tap, load, source-build, and test formula on macOS
+        run: |
+          TAP_DIR="$(brew --repository)/Library/Taps/local/homebrew-ci"
+          mkdir -p "$(dirname "$TAP_DIR")"
+          ln -sfn "$GITHUB_WORKSPACE" "$TAP_DIR"
+          brew readall "local/ci"
+          for f in Formula/*.rb; do
+            pkg=$(basename "$f" .rb)
+            brew install --verbose --formula "local/ci/$pkg"
+            brew test --verbose "local/ci/$pkg"
+            brew uninstall "local/ci/$pkg"
+          done
